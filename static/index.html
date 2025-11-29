@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FRED Explorer - Federal Reserve Economic Data</title>
+    
+    <!-- Vuetify CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/vuetify@3.4.4/dist/vuetify.min.css" rel="stylesheet">
+    <!-- Material Design Icons -->
+    <link href="https://cdn.jsdelivr.net/npm/@mdi/font@7.3.67/css/materialdesignicons.min.css" rel="stylesheet">
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"></script>
+    
+    <style>
+        .chart-container {
+            position: relative;
+            height: 400px;
+            width: 100%;
+        }
+        .loading-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(255, 255, 255, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+        .cache-indicator {
+            font-size: 0.8em;
+            opacity: 0.8;
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <v-app>
+            <!-- Navigation -->
+            <v-app-bar color="primary" dark>
+                <v-app-bar-title>
+                    <v-icon class="mr-2">mdi-chart-line</v-icon>
+                    FRED Explorer
+                    <v-chip class="ml-2" size="small" color="success" variant="outlined">
+                        <v-icon left size="small">mdi-database</v-icon>
+                        Cached
+                    </v-chip>
+                </v-app-bar-title>
+                
+                <v-spacer></v-spacer>
+                
+                <v-btn to="/" text>
+                    <v-icon left>mdi-home</v-icon>
+                    Home
+                </v-btn>
+                
+                <v-btn to="/releases" text>
+                    <v-icon left>mdi-database</v-icon>
+                    Releases
+                </v-btn>
+                
+                <v-btn to="/series" text>
+                    <v-icon left>mdi-chart-timeline-variant</v-icon>
+                    Series
+                </v-btn>
+                
+                <v-btn to="/database" text>
+                    <v-icon left>mdi-database-cog</v-icon>
+                    Database
+                </v-btn>
+            </v-app-bar>
+
+            <!-- Main Content -->
+            <v-main>
+                <v-container fluid>
+                    <router-view></router-view>
+                </v-container>
+            </v-main>
+
+            <!-- Footer -->
+            <v-footer color="grey-lighten-3" class="text-center">
+                <div>
+                    <strong>FRED Explorer</strong> - Explore Federal Reserve Economic Data with SQLite Caching
+                    <br>
+                    <small>Data provided by Federal Reserve Bank of St. Louis</small>
+                </div>
+            </v-footer>
+        </v-app>
+    </div>
+
+    <!-- Vue 3 -->
+    <script src="https://unpkg.com/vue@3.3.8/dist/vue.global.js"></script>
+    <!-- Vue Router -->
+    <script src="https://unpkg.com/vue-router@4.2.5/dist/vue-router.global.js"></script>
+    <!-- Vuetify -->
+    <script src="https://cdn.jsdelivr.net/npm/vuetify@3.4.4/dist/vuetify.min.js"></script>
+
+    <script>
+        const { createApp, ref, reactive, computed, onMounted, watch, nextTick } = Vue;
+        const { createRouter, createWebHistory } = VueRouter;
+        const { createVuetify } = Vuetify;
+
+        // API Service
+        const api = {
+            async get(url) {
+                const response = await fetch(url);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                return response.json();
+            },
+            
+            async post(url, data) {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(data)
+                });
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                return response.json();
+            },
+
+            getReleases: (limit = 20, forceRefresh = false) => 
+                api.get(`/api/releases?limit=${limit}&force_refresh=${forceRefresh}`),
+            getRelease: (id, forceRefresh = false) => 
+                api.get(`/api/release/${id}?force_refresh=${forceRefresh}`),
+            getReleaseSeries: (id, limit = 20, forceRefresh = false) => 
+                api.get(`/api/release/${id}/series?limit=${limit}&force_refresh=${forceRefresh}`),
+            getReleaseObservations: (releaseId, seriesLimit = 10, obsLimit = 50, forceRefresh = false) => 
+                api.post('/api/release/observations', {
+                    release_id: releaseId,
+                    series_limit: seriesLimit,
+                    obs_limit: obsLimit,
+                    force_refresh: forceRefresh
+                }),
+            getSeriesObservations: (seriesId, limit = 100, startDate = null, endDate = null, forceRefresh = false) =>
+                api.post('/api/series/observations', {
+                    series_id: seriesId,
+                    limit: limit,
+                    observation_start: startDate,
+                    observation_end: endDate,
+                    force_refresh: forceRefresh
+                }),
+            getDatabaseStats: () => api.get('/api/database/stats'),
+            clearCache: (cacheType = null) => api.post('/api/database/clear-cache', { cache_type: cacheType })
+        };
+
+        // Chart utility
+        const chartUtils = {
+            createChart(canvasId, data, label) {
+                // Wait for element to be available
+                const waitForElement = (id, maxAttempts = 10) => {
+                    return new Promise((resolve, reject) => {
+                        let attempts = 0;
+                        const checkElement = () => {
+                            const element = document.getElementById(id);
+                            if (element) {
+                                resolve(element);
+                            } else if (attempts < maxAttempts) {
+                                attempts++;
+                                setTimeout(checkElement, 50);
+                            } else {
+                                reject(new Error(`Element ${id} not found after ${maxAttempts} attempts`));
+                            }
+                        };
+                        checkElement();
+                    });
+                };
+                
+                return waitForElement(canvasId).then(ctx => {
+                    if (typeof Chart === 'undefined') {
+                        console.error('Chart.js not loaded');
+                        return null;
+                    }
+
+                    const chartData = {
+                        labels: data.map(d => d.date),
+                        datasets: [{
+                            label: label,
+                            data: data.map(d => parseFloat(d.value) || null),
+                            borderColor: 'rgb(75, 192, 192)',
+                            backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                            tension: 0.1,
+                            spanGaps: true
+                        }]
+                    };
+
+                    try {
+                        const chart = new Chart(ctx, {
+                            type: 'line',
+                            data: chartData,
+                            options: {
+                                responsive: true,
+                                maintainAspectRatio: false,
+                                scales: {
+                                    y: {
+                                        beginAtZero: false
+                                    }
+                                },
+                                plugins: {
+                                    legend: {
+                                        display: true
+                                    }
+                                }
+                            }
+                        });
+                        return chart;
+                    } catch (error) {
+                        console.error('Error creating chart:', error);
+                        return null;
+                    }
+                }).catch(error => {
+                    console.error('Error waiting for canvas element:', error);
+                    return null;
+                });
+            }
+        };
+
+        // Home Component
+        const Home = {
+            template: `
+                <div>
+                    <v-row>
+                        <v-col cols="12">
+                            <v-card class="mb-6">
+                                <v-card-title class="text-h4 text-center">
+                                    <v-icon large class="mr-3">mdi-chart-line</v-icon>
+                                    Welcome to FRED Explorer
+                                    <v-chip class="ml-3" color="success" variant="outlined">
+                                        <v-icon left size="small">mdi-database</v-icon>
+                                        SQLite Cached
+                                    </v-chip>
+                                </v-card-title>
+                                <v-card-text class="text-center">
+                                    <p class="text-h6 mb-4">
+                                        Explore Federal Reserve Economic Data with high-performance SQLite caching
+                                    </p>
+                                    <p class="text-body-1">
+                                        Browse economic releases, view data series, and visualize trends 
+                                        from the Federal Reserve Bank of St. Louis. Data is automatically cached 
+                                        for faster subsequent access.
+                                    </p>
+                                </v-card-text>
+                            </v-card>
+                        </v-col>
+                    </v-row>
+
+                    <v-row>
+                        <v-col cols="12" md="3">
+                            <v-card height="200" class="d-flex align-center justify-center" color="primary" dark>
+                                <div class="text-center">
+                                    <v-icon size="64" class="mb-3">mdi-database</v-icon>
+                                    <div class="text-h6">Browse Releases</div>
+                                    <div class="text-body-2">Explore economic data releases</div>
+                                    <v-btn class="mt-3" variant="outlined" to="/releases">
+                                        Get Started
+                                    </v-btn>
+                                </div>
+                            </v-card>
+                        </v-col>
+                        
+                        <v-col cols="12" md="3">
+                            <v-card height="200" class="d-flex align-center justify-center" color="secondary" dark>
+                                <div class="text-center">
+                                    <v-icon size="64" class="mb-3">mdi-chart-timeline-variant</v-icon>
+                                    <div class="text-h6">View Series</div>
+                                    <div class="text-body-2">Analyze data series and trends</div>
+                                    <v-btn class="mt-3" variant="outlined" to="/series">
+                                        Explore
+                                    </v-btn>
+                                </div>
+                            </v-card>
+                        </v-col>
+                        
+                        <v-col cols="12" md="3">
+                            <v-card height="200" class="d-flex align-center justify-center" color="success" dark>
+                                <div class="text-center">
+                                    <v-icon size="64" class="mb-3">mdi-chart-areaspline</v-icon>
+                                    <div class="text-h6">Visualize Data</div>
+                                    <div class="text-body-2">Interactive charts and graphs</div>
+                                    <v-btn class="mt-3" variant="outlined" to="/series">
+                                        View Charts
+                                    </v-btn>
+                                </div>
+                            </v-card>
+                        </v-col>
+                        
+                        <v-col cols="12" md="3">
+                            <v-card height="200" class="d-flex align-center justify-center" color="info" dark>
+                                <div class="text-center">
+                                    <v-icon size="64" class="mb-3">mdi-database-cog</v-icon>
+                                    <div class="text-h6">Database Stats</div>
+                                    <div class="text-body-2">Cache management & statistics</div>
+                                    <v-btn class="mt-3" variant="outlined" to="/database">
+                                        Manage
+                                    </v-btn>
+                                </div>
+                            </v-card>
+                        </v-col>
+                    </v-row>
+
+                    <v-row class="mt-6">
+                        <v-col cols="12">
+                            <v-card>
+                                <v-card-title>
+                                    <v-icon class="mr-2">mdi-information</v-icon>
+                                    About FRED Explorer with SQLite Caching
+                                </v-card-title>
+                                <v-card-text>
+                                    <p>
+                                        The Federal Reserve Economic Data (FRED) database contains thousands of economic time series 
+                                        from scores of national, international, public, and private sources. FRED is created and 
+                                        maintained by the Research Department at the Federal Reserve Bank of St. Louis.
+                                    </p>
+                                    <p class="mt-3">
+                                        This enhanced explorer provides an intuitive interface with <strong>SQLite caching</strong> 
+                                        for improved performance. Data is automatically cached locally, reducing API calls and 
+                                        providing faster access to previously viewed data.
+                                    </p>
+                                    <v-row class="mt-4">
+                                        <v-col cols="12" md="6">
+                                            <h4>✨ New Features:</h4>
+                                            <ul class="mt-2">
+                                                <li>🚀 High-performance SQLite caching</li>
+                                                <li>📊 Database statistics and management</li>
+                                                <li>⚡ Faster data loading for cached content</li>
+                                                <li>🔄 Smart cache invalidation</li>
+                                            </ul>
+                                        </v-col>
+                                        <v-col cols="12" md="6">
+                                            <h4>🎯 Benefits:</h4>
+                                            <ul class="mt-2">
+                                                <li>Reduced API rate limiting</li>
+                                                <li>Offline browsing of cached data</li>
+                                                <li>Improved application responsiveness</li>
+                                                <li>Lower bandwidth usage</li>
+                                            </ul>
+                                        </v-col>
+                                    </v-row>
+                                </v-card-text>
+                            </v-card>
+                        </v-col>
+                    </v-row>
+                </div>
+            `
+        };
+
+        // Database Component
+        const Database = {
+            setup() {
+                const stats = ref(null);
+                const loading = ref(false);
+                const error = ref(null);
+
+                const loadStats = async () => {
+                    loading.value = true;
+                    error.value = null;
+                    try {
+                        stats.value = await api.getDatabaseStats();
+                    } catch (err) {
+                        error.value = err.message;
+                    } finally {
+                        loading.value = false;
+                    }
+                };
+
+                const clearCache = async () => {
+                    try {
+                        await api.clearCache();
+                        await loadStats(); // Reload stats
+                    } catch (err) {
+                        error.value = err.message;
+                    }
+                };
+
+                onMounted(loadStats);
+
+                return {
+                    stats,
+                    loading,
+                    error,
+                    loadStats,
+                    clearCache
+                };
+            },
+            template: `
+                <div>
+                    <v-row>
+                        <v-col cols="12">
+                            <v-card>
+                                <v-card-title>
+                                    <v-icon class="mr-2">mdi-database-cog</v-icon>
+                                    Database Management
+                                </v-card-title>
+                                
+                                <v-card-text>
+                                    <v-row>
+                                        <v-col cols="12" md="6">
+                                            <v-btn 
+                                                @click="loadStats" 
+                                                color="primary" 
+                                                :loading="loading"
+                                                class="mr-2"
+                                            >
+                                                <v-icon left>mdi-refresh</v-icon>
+                                                Refresh Stats
+                                            </v-btn>
+                                            
+                                            <v-btn 
+                                                @click="clearCache" 
+                                                color="warning" 
+                                                variant="outlined"
+                                            >
+                                                <v-icon left>mdi-delete</v-icon>
+                                                Clear Cache
+                                            </v-btn>
+                                        </v-col>
+                                    </v-row>
+                                </v-card-text>
+                            </v-card>
+                        </v-col>
+                    </v-row>
+
+                    <v-row v-if="error">
+                        <v-col cols="12">
+                            <v-alert type="error">{{ error }}</v-alert>
+                        </v-col>
+                    </v-row>
+
+                    <v-row v-if="stats && !loading">
+                        <v-col cols="12" md="6">
+                            <v-card>
+                                <v-card-title>
+                                    <v-icon class="mr-2">mdi-chart-bar</v-icon>
+                                    Cache Statistics
+                                </v-card-title>
+                                <v-card-text>
+                                    <v-list>
+                                        <v-list-item>
+                                            <v-list-item-title>Releases Cached</v-list-item-title>
+                                            <v-list-item-subtitle>{{ stats.releases || 0 }}</v-list-item-subtitle>
+                                        </v-list-item>
+                                        <v-list-item>
+                                            <v-list-item-title>Series Cached</v-list-item-title>
+                                            <v-list-item-subtitle>{{ stats.series || 0 }}</v-list-item-subtitle>
+                                        </v-list-item>
+                                        <v-list-item>
+                                            <v-list-item-title>Observations Cached</v-list-item-title>
+                                            <v-list-item-subtitle>{{ stats.observations || 0 }}</v-list-item-subtitle>
+                                        </v-list-item>
+                                        <v-list-item>
+                                            <v-list-item-title>Cache Entries</v-list-item-title>
+                                            <v-list-item-subtitle>{{ stats.cache_entries || 0 }}</v-list-item-subtitle>
+                                        </v-list-item>
+                                    </v-list>
+                                </v-card-text>
+                            </v-card>
+                        </v-col>
+                        
+                        <v-col cols="12" md="6">
+                            <v-card>
+                                <v-card-title>
+                                    <v-icon class="mr-2">mdi-database</v-icon>
+                                    Database Info
+                                </v-card-title>
+                                <v-card-text>
+                                    <v-list>
+                                        <v-list-item>
+                                            <v-list-item-title>Database File</v-list-item-title>
+                                            <v-list-item-subtitle>{{ stats.database_file || 'N/A' }}</v-list-item-subtitle>
+                                        </v-list-item>
+                                        <v-list-item>
+                                            <v-list-item-title>Database Exists</v-list-item-title>
+                                            <v-list-item-subtitle>
+                                                <v-chip 
+                                                    :color="stats.database_exists ? 'success' : 'error'" 
+                                                    size="small"
+                                                >
+                                                    {{ stats.database_exists ? 'Yes' : 'No' }}
+                                                </v-chip>
+                                            </v-list-item-subtitle>
+                                        </v-list-item>
+                                    </v-list>
+                                </v-card-text>
+                            </v-card>
+                        </v-col>
+                    </v-row>
+
+                    <v-row v-if="!stats && !loading && !error">
+                        <v-col cols="12">
+                            <v-card class="d-flex align-center justify-center" height="300">
+                                <div class="text-center text-grey">
+                                    <v-icon size="64" class="mb-3">mdi-database-search</v-icon>
+                                    <div>Click "Refresh Stats" to load database information</div>
+                                </div>
+                            </v-card>
+                        </v-col>
+                    </v-row>
+                </div>
+            `
+        };
+
+        // Enhanced Releases Component with cache indicators
+        const Releases = {
+            setup() {
+                const releases = ref([]);
+                const loading = ref(false);
+                const error = ref(null);
+                const selectedRelease = ref(null);
+                const releaseDetails = ref(null);
+                const releaseSeries = ref([]);
+                const loadingDetails = ref(false);
+                const forceRefresh = ref(false);
+
+                const loadReleases = async () => {
+                    loading.value = true;
+                    error.value = null;
+                    try {
+                        const data = await api.getReleases(50, forceRefresh.value);
+                        releases.value = data.releases || [];
+                    } catch (err) {
+                        error.value = err.message;
+                    } finally {
+                        loading.value = false;
+                    }
+                };
+
+                const selectRelease = async (release) => {
+                    selectedRelease.value = release;
+                    loadingDetails.value = true;
+                    try {
+                        const [details, series] = await Promise.all([
+                            api.getRelease(release.id, forceRefresh.value),
+                            api.getReleaseSeries(release.id, 20, forceRefresh.value)
+                        ]);
+                        releaseDetails.value = details.releases[0];
+                        releaseSeries.value = series.seriess || [];
+                    } catch (err) {
+                        error.value = err.message;
+                    } finally {
+                        loadingDetails.value = false;
+                    }
+                };
+
+                onMounted(loadReleases);
+
+                return {
+                    releases,
+                    loading,
+                    error,
+                    selectedRelease,
+                    releaseDetails,
+                    releaseSeries,
+                    loadingDetails,
+                    forceRefresh,
+                    selectRelease,
+                    loadReleases
+                };
+            },
+            template: `
+                <div>
+                    <v-row>
+                        <v-col cols="12" md="6">
+                            <v-card>
+                                <v-card-title>
+                                    <v-icon class="mr-2">mdi-database</v-icon>
+                                    Economic Data Releases
+                                </v-card-title>
+                                
+                                <v-card-text>
+                                    <v-row class="mb-3">
+                                        <v-col cols="12">
+                                            <v-switch
+                                                v-model="forceRefresh"
+                                                label="Force API Refresh (bypass cache)"
+                                                color="warning"
+                                                hide-details
+                                            ></v-switch>
+                                            <v-btn 
+                                                @click="loadReleases" 
+                                                color="primary" 
+                                                :loading="loading"
+                                                class="mt-2"
+                                                size="small"
+                                            >
+                                                <v-icon left>mdi-refresh</v-icon>
+                                                Reload
+                                            </v-btn>
+                                        </v-col>
+                                    </v-row>
+                                    
+                                    <v-progress-linear v-if="loading" indeterminate></v-progress-linear>
+                                    
+                                    <v-alert v-if="error" type="error" class="mb-4">
+                                        {{ error }}
+                                    </v-alert>
+                                    
+                                    <v-list v-if="!loading && releases.length">
+                                        <v-list-item
+                                            v-for="release in releases"
+                                            :key="release.id"
+                                            @click="selectRelease(release)"
+                                            :class="{ 'bg-blue-lighten-5': selectedRelease?.id === release.id }"
+                                        >
+                                            <v-list-item-title>{{ release.name }}</v-list-item-title>
+                                            <v-list-item-subtitle>ID: {{ release.id }}</v-list-item-subtitle>
+                                        </v-list-item>
+                                    </v-list>
+                                </v-card-text>
+                            </v-card>
+                        </v-col>
+                        
+                        <v-col cols="12" md="6">
+                            <v-card v-if="selectedRelease">
+                                <v-card-title>Release Details</v-card-title>
+                                
+                                <v-card-text>
+                                    <v-progress-linear v-if="loadingDetails" indeterminate></v-progress-linear>
+                                    
+                                    <div v-if="releaseDetails && !loadingDetails">
+                                        <h3>{{ releaseDetails.name }}</h3>
+                                        <p class="mt-2"><strong>ID:</strong> {{ releaseDetails.id }}</p>
+                                        <p v-if="releaseDetails.notes" class="mt-2">
+                                            <strong>Notes:</strong> {{ releaseDetails.notes }}
+                                        </p>
+                                        
+                                        <v-divider class="my-4"></v-divider>
+                                        
+                                        <h4>Data Series ({{ releaseSeries.length }})</h4>
+                                        <v-list v-if="releaseSeries.length" class="mt-2">
+                                            <v-list-item
+                                                v-for="series in releaseSeries.slice(0, 10)"
+                                                :key="series.id"
+                                                @click="$router.push('/series?id=' + series.id)"
+                                                class="cursor-pointer"
+                                            >
+                                                <v-list-item-title>{{ series.title }}</v-list-item-title>
+                                                <v-list-item-subtitle>
+                                                    {{ series.id }} | {{ series.frequency }}
+                                                </v-list-item-subtitle>
+                                            </v-list-item>
+                                        </v-list>
+                                        
+                                        <v-btn 
+                                            v-if="releaseSeries.length > 10"
+                                            class="mt-2" 
+                                            variant="outlined"
+                                            @click="$router.push('/series?release=' + selectedRelease.id)"
+                                        >
+                                            View All Series
+                                        </v-btn>
+                                    </div>
+                                </v-card-text>
+                            </v-card>
+                            
+                            <v-card v-else class="d-flex align-center justify-center" height="300">
+                                <div class="text-center text-grey">
+                                    <v-icon size="64" class="mb-3">mdi-mouse-variant</v-icon>
+                                    <div>Select a release to view details</div>
+                                </div>
+                            </v-card>
+                        </v-col>
+                    </v-row>
+                </div>
+            `
+        };
+
+        // Enhanced Series Component with cache indicators
+        const Series = {
+            setup() {
+                const route = VueRouter.useRoute();
+                const router = VueRouter.useRouter();
+                
+                const seriesId = ref('');
+                const seriesData = ref(null);
+                const observations = ref([]);
+                const loading = ref(false);
+                const error = ref(null);
+                const chart = ref(null);
+                const startDate = ref('');
+                const endDate = ref('');
+                const limit = ref(100);
+                const forceRefresh = ref(false);
+                const cached = ref(false);
+
+                const loadSeries = async () => {
+                    if (!seriesId.value) return;
+                    
+                    loading.value = true;
+                    error.value = null;
+                    
+                    try {
+                        const data = await api.getSeriesObservations(
+                            seriesId.value, 
+                            limit.value,
+                            startDate.value || null,
+                            endDate.value || null,
+                            forceRefresh.value
+                        );
+                        
+                        seriesData.value = data;
+                        observations.value = data.observations || [];
+                        cached.value = data.cached || false;
+                        
+                    } catch (err) {
+                        error.value = err.message;
+                    } finally {
+                        loading.value = false;
+                        
+                        // Create chart after loading is complete and DOM is updated
+                        if (observations.value.length > 0) {
+                            await nextTick();
+                            if (chart.value) {
+                                chart.value.destroy();
+                            }
+                            chart.value = await chartUtils.createChart(
+                                'seriesChart',
+                                observations.value,
+                                seriesId.value
+                            );
+                        }
+                    }
+                };
+
+                // Watch for route changes
+                watch(() => route.query.id, (newId) => {
+                    if (newId) {
+                        seriesId.value = newId;
+                        loadSeries();
+                    }
+                }, { immediate: true });
+
+                onMounted(() => {
+                    if (route.query.id) {
+                        seriesId.value = route.query.id;
+                        loadSeries();
+                    }
+                });
+
+                return {
+                    seriesId,
+                    seriesData,
+                    observations,
+                    loading,
+                    error,
+                    startDate,
+                    endDate,
+                    limit,
+                    forceRefresh,
+                    cached,
+                    loadSeries
+                };
+            },
+            template: `
+                <div>
+                    <v-row>
+                        <v-col cols="12">
+                            <v-card>
+                                <v-card-title>
+                                    <v-icon class="mr-2">mdi-chart-timeline-variant</v-icon>
+                                    Data Series Explorer
+                                    <v-chip v-if="cached" class="ml-2" color="success" size="small">
+                                        <v-icon left size="small">mdi-database-check</v-icon>
+                                        Cached
+                                    </v-chip>
+                                </v-card-title>
+                                
+                                <v-card-text>
+                                    <v-row>
+                                        <v-col cols="12" md="4">
+                                            <v-text-field
+                                                v-model="seriesId"
+                                                label="Series ID"
+                                                placeholder="e.g., GDPC1, UNRATE, CPIAUCSL"
+                                                @keyup.enter="loadSeries"
+                                            ></v-text-field>
+                                        </v-col>
+                                        <v-col cols="12" md="2">
+                                            <v-text-field
+                                                v-model="startDate"
+                                                label="Start Date"
+                                                type="date"
+                                            ></v-text-field>
+                                        </v-col>
+                                        <v-col cols="12" md="2">
+                                            <v-text-field
+                                                v-model="endDate"
+                                                label="End Date"
+                                                type="date"
+                                            ></v-text-field>
+                                        </v-col>
+                                        <v-col cols="12" md="2">
+                                            <v-switch
+                                                v-model="forceRefresh"
+                                                label="Force Refresh"
+                                                color="warning"
+                                                hide-details
+                                            ></v-switch>
+                                        </v-col>
+                                        <v-col cols="12" md="2">
+                                            <v-btn 
+                                                @click="loadSeries" 
+                                                color="primary" 
+                                                :loading="loading"
+                                                block
+                                            >
+                                                Load Data
+                                            </v-btn>
+                                        </v-col>
+                                    </v-row>
+                                </v-card-text>
+                            </v-card>
+                        </v-col>
+                    </v-row>
+
+                    <v-row v-if="error">
+                        <v-col cols="12">
+                            <v-alert type="error">{{ error }}</v-alert>
+                        </v-col>
+                    </v-row>
+
+                    <v-row v-if="seriesData && !loading">
+                        <v-col cols="12">
+                            <v-card>
+                                <v-card-title>
+                                    {{ seriesId }}
+                                    <v-chip v-if="cached" class="ml-2" color="success" size="small">
+                                        <v-icon left size="small">mdi-database-check</v-icon>
+                                        From Cache
+                                    </v-chip>
+                                    <v-chip v-else class="ml-2" color="info" size="small">
+                                        <v-icon left size="small">mdi-web</v-icon>
+                                        From API
+                                    </v-chip>
+                                </v-card-title>
+                                <v-card-text>
+                                    <div class="chart-container">
+                                        <canvas id="seriesChart"></canvas>
+                                        <div v-if="loading" class="loading-overlay">
+                                            <v-progress-circular indeterminate></v-progress-circular>
+                                        </div>
+                                    </div>
+                                </v-card-text>
+                            </v-card>
+                        </v-col>
+                    </v-row>
+
+                    <v-row v-if="observations.length && !loading">
+                        <v-col cols="12">
+                            <v-card>
+                                <v-card-title>
+                                    Data Points ({{ observations.length }})
+                                </v-card-title>
+                                <v-card-text>
+                                    <v-data-table
+                                        :headers="[
+                                            { title: 'Date', key: 'date' },
+                                            { title: 'Value', key: 'value' }
+                                        ]"
+                                        :items="observations"
+                                        :items-per-page="10"
+                                        class="elevation-1"
+                                    ></v-data-table>
+                                </v-card-text>
+                            </v-card>
+                        </v-col>
+                    </v-row>
+
+                    <v-row v-if="!seriesData && !loading && !error">
+                        <v-col cols="12">
+                            <v-card class="d-flex align-center justify-center" height="300">
+                                <div class="text-center text-grey">
+                                    <v-icon size="64" class="mb-3">mdi-chart-timeline-variant</v-icon>
+                                    <div>Enter a series ID to explore economic data</div>
+                                    <div class="mt-2 text-body-2">
+                                        Popular series: GDPC1 (GDP), UNRATE (Unemployment), CPIAUCSL (CPI)
+                                    </div>
+                                </div>
+                            </v-card>
+                        </v-col>
+                    </v-row>
+                </div>
+            `
+        };
+
+        // Router setup
+        const routes = [
+            { path: '/', component: Home },
+            { path: '/releases', component: Releases },
+            { path: '/series', component: Series },
+            { path: '/database', component: Database }
+        ];
+
+        const router = createRouter({
+            history: createWebHistory(),
+            routes
+        });
+
+        // Vuetify setup
+        const vuetify = createVuetify({
+            theme: {
+                defaultTheme: 'light'
+            }
+        });
+
+        // Create and mount the app
+        createApp({})
+            .use(router)
+            .use(vuetify)
+            .mount('#app');
+    </script>
+</body>
+</html>
